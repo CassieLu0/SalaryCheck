@@ -28,7 +28,7 @@ tiers = ["6磅以下", "6-10磅", "10-20磅", "20磅以上", "超重件"]
 base_rows = []
 for r in routes:
     for t in tiers:
-        base_rows.append({"线路": r, "档位": t, "首票单价": None, "联单单价": None})
+       base_rows.append({"线路": r, "档位": t, "首票单价": 0.0, "联单单价": 0.0})
 
 # 3) editable grid, only allow editing the 2 price columns
 df_price = pd.DataFrame(base_rows)
@@ -70,7 +70,6 @@ SHEET_DELIVERY = "派费明细"
 SHEET_ROUTE    = "参数_线路明细"   # 你已经加了
 
 df_delivery = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
-df_route_price = edited_df.copy()
 
 # =========================
 # 2) 派费明细列名（不一致就在这里改）
@@ -133,7 +132,7 @@ if miss2:
 
 df[COL_DRIVER_ID] = df[COL_DRIVER_ID].astype(str).str.strip()
 df[COL_DRIVER]    = df[COL_DRIVER].astype(str).str.strip()
-df["_route"]      = df[COL_ROUTE].astype(str).fillna("DEFAULT").str.strip()
+df["_route"] = df[COL_ROUTE].astype(str).fillna("").str.strip()
 df["_weight"]     = pd.to_numeric(df[COL_WEIGHT], errors="coerce").fillna(0.0)
 df["_bucket"]     = df["_weight"].apply(weight_bucket)
 
@@ -178,6 +177,8 @@ wb = Workbook()
 ws = wb.active
 ws.title = "司机汇总"
 
+df_route_price["匹配键"] = df_route_price["线路"] + "|" + df_route_price["档位"]
+
 ws_route = wb.create_sheet("参数_线路明细")
 ws_route.append(["线路", "档位", "首票单价", "联单单价", "匹配键"])
 for cell in ws_route[1]:
@@ -220,11 +221,11 @@ df_route_price["首票单价"] = pd.to_numeric(df_route_price["首票单价"], e
 df_route_price["联单单价"] = pd.to_numeric(df_route_price["联单单价"], errors="coerce")
 
 missing_price = df_route_price["首票单价"].isna() | df_route_price["联单单价"].isna()
+
 if missing_price.any():
     st.error("单价未填写完整，请补全 首票单价 和 联单单价")
     st.stop()
 
-df_route_price["匹配键"] = df_route_price["线路"] + "|" + df_route_price["档位"]
 
 # =========================
 # 9) 表头（司机汇总）
