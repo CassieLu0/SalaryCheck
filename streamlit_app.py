@@ -14,27 +14,63 @@ if uploaded_file is None:
     st.info("Please upload an Excel or csv file to continue.")
     st.stop()
 
-if uploaded_file:
-    # read file
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+SHEET_DELIVERY = "派费明细"
+SHEET_ROUTE    = "参数_线路明细"
 
-    st.subheader("Raw Data Preview")
-    st.dataframe(df)
+st.subheader("线路单价 (输入价格)")
 
 
-def generate_salary_summary(df):
-    # your full logic here
+# 1) define the fixed structure (线路 x 档位)
+routes = ["SEA01-004", "SEA01-005"]
+tiers = ["6磅以下", "6-10磅", "10-20磅", "20磅以上", "超重件"]
 
-    df = pd.read_excel(uploaded_file, sheet_name="派费明细")
+# 2) build the table like Excel
+base_rows = []
+for r in routes:
+    for t in tiers:
+        base_rows.append({"线路": r, "档位": t, "首票单价": None, "联单单价": None})
+
+# 3) editable grid, only allow editing the 2 price columns
+df_price = pd.DataFrame(base_rows)
+
+edited_df = st.data_editor(
+    df_price,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "线路": st.column_config.TextColumn("线路", disabled=True),
+        "档位": st.column_config.TextColumn("档位", disabled=True),
+        "首票单价": st.column_config.NumberColumn("首票单价", min_value=0.0, step=0.01, format="%.2f"),
+        "联单单价": st.column_config.NumberColumn("联单单价", min_value=0.0, step=0.01, format="%.2f"),
+    },
+)
+df_route_price = edited_df.copy()
+df_route_price.columns = df_route_price.columns.astype(str).str.strip()
+
+st.dataframe(df_route_price[["线路","档位","首票单价","联单单价"]])
+
+if uploaded_file.name.endswith(".csv"):
+    st.error("你的逻辑依赖 Excel 多 sheet，csv 不支持，请上传 xlsx")
+    st.stop()
+
+df = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
+df.columns = df.columns.astype(str).str.strip()
+
+st.subheader("Raw Data Preview (派费明细)")
+st.dataframe(df.head(50))
+
+
+# full logic here
+
+df = pd.read_excel(uploaded_file, sheet_name="派费明细")
 # =========================
 # 1) Sheet 名
 # =========================
 SHEET_DELIVERY = "派费明细"
 SHEET_ROUTE    = "参数_线路明细"   # 你已经加了
 
+df_delivery = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
+df_route_price = edited_df.copy()
 
 # =========================
 # 2) 派费明细列名（不一致就在这里改）
@@ -83,17 +119,17 @@ def weight_bucket(w):
 # 4) 读数据
 # =========================
 df = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
+df.columns = df.columns.astype(str).str.strip()
 
 need = [COL_DRIVER_ID, COL_DRIVER, COL_ROUTE, COL_WEIGHT, COL_TASK, COL_STOP]
 miss = [c for c in need if c not in df.columns]
 if miss:
     raise ValueError(f"派费明细缺少列: {miss}")
 
-df_route_price = pd.read_excel(uploaded_file, sheet_name=SHEET_ROUTE)
 need2 = ["线路", "档位", "首票单价", "联单单价"]
 miss2 = [c for c in need2 if c not in df_route_price.columns]
 if miss2:
-    raise ValueError(f"{SHEET_ROUTE} 缺少列: {miss2}")
+    raise ValueError(f"网页单价表缺少列: {miss2}")
 
 df[COL_DRIVER_ID] = df[COL_DRIVER_ID].astype(str).str.strip()
 df[COL_DRIVER]    = df[COL_DRIVER].astype(str).str.strip()
@@ -143,6 +179,19 @@ ws = wb.active
 ws.title = "司机汇总"
 
 ws_route = wb.create_sheet("参数_线路明细")
+ws_route.append(["线路", "档位", "首票单价", "联单单价", "匹配键"])
+for cell in ws_route[1]:
+    cell.font =  Font(bold=True)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+for _, row in df_route_price.iterrows():
+    ws_route.append([
+        row["线路"],
+        row["档位"],
+        float(row["首票单价"]),
+        float(row["联单单价"]),
+        row["匹配键"],
+    ])
 
 
 # =========================
@@ -163,27 +212,19 @@ fill_blue = PatternFill("solid", fgColor="D9E1F2")
 # =========================
 # 8) 写 参数_线路明细（真正单价来源）
 # =========================
-df_route_price = df_route_price.copy()
+df_route_price = edited_df.copy()
+
 df_route_price["线路"] = df_route_price["线路"].astype(str).str.strip()
 df_route_price["档位"] = df_route_price["档位"].astype(str).str.strip()
+df_route_price["首票单价"] = pd.to_numeric(df_route_price["首票单价"], errors="coerce")
+df_route_price["联单单价"] = pd.to_numeric(df_route_price["联单单价"], errors="coerce")
+
+missing_price = df_route_price["首票单价"].isna() | df_route_price["联单单价"].isna()
+if missing_price.any():
+    st.error("单价未填写完整，请补全 首票单价 和 联单单价")
+    st.stop()
+
 df_route_price["匹配键"] = df_route_price["线路"] + "|" + df_route_price["档位"]
-
-ws_route.append(["线路", "档位", "首票单价", "联单单价", "匹配键"])
-for cell in ws_route[1]:
-    cell.font = bold
-    cell.alignment = center
-
-for _, row in df_route_price.iterrows():
-    ws_route.append([
-        row["线路"],
-        row["档位"],
-        float(row["首票单价"]),
-        float(row["联单单价"]),
-        row["匹配键"],
-    ])
-
-for col in range(1, 6):
-    ws_route.column_dimensions[get_column_letter(col)].width = 18
 
 # =========================
 # 9) 表头（司机汇总）
