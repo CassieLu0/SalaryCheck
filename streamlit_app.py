@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, date
+from datetime import datetime
 from io import BytesIO
 
 import streamlit as st
@@ -29,31 +29,32 @@ def safe_filename(s: str) -> str:
     return s or "工资单"
 
 def parse_fleet_and_period_from_filename(name: str):
-    fleet = None
-    d1 = None
-    d2 = None
+    """
+    Expect filename like:
+      <fleet>-派费明细-02_02_2026-08_02_2026-...xlsx
+
+    Return (fleet, "02_02_2026-08_02_2026") or (None, None) if parse fails.
+    """
     if not name:
-        return fleet, d1, d2
+        return None, None
 
     m_fleet = re.search(r"^(.*?)-派费明细-", name)
-    if m_fleet:
-        fleet = m_fleet.group(1).strip()
-
     m_period = re.search(r"(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})", name)
+
+    fleet = m_fleet.group(1).strip() if m_fleet else None
     if m_period:
-        s1, s2 = m_period.group(1), m_period.group(2)
+        p1, p2 = m_period.group(1), m_period.group(2)
+        # validate date format strictly
         try:
-            d1 = datetime.strptime(s1, "%m_%d_%Y").date()
-            d2 = datetime.strptime(s2, "%m_%d_%Y").date()
+            datetime.strptime(p1, "%m_%d_%Y")
+            datetime.strptime(p2, "%m_%d_%Y")
+            period = f"{p1}-{p2}"
         except Exception:
-            d1, d2 = None, None
+            period = None
+    else:
+        period = None
 
-    return fleet, d1, d2
-
-def fmt_period(d1: date | None, d2: date | None) -> str:
-    if not d1 or not d2:
-        return "未知帐期"
-    return f"{d1.strftime('%m_%d_%Y')}-{d2.strftime('%m_%d_%Y')}"
+    return fleet, period
 
 def build_workbook(
     df_delivery: pd.DataFrame,
@@ -61,9 +62,7 @@ def build_workbook(
     df_offset: pd.DataFrame,
     df_claim_raw: pd.DataFrame | None,
 ):
-    # =========================
     # Columns mapping
-    # =========================
     COL_DRIVER_ID = "快递员ID"
     COL_DRIVER = "快递员"
     COL_ROUTE = "区域/线路"
@@ -71,9 +70,7 @@ def build_workbook(
     COL_TASK = "任务号"
     COL_STOP = "STOP序号"
 
-    # =========================
     # Weight buckets (3 tiers)
-    # =========================
     BUCKETS = [
         ("0-5lb", 0, 5),         # [0,5)
         ("5-20lb", 5, 20),       # [5,20)
@@ -85,7 +82,6 @@ def build_workbook(
             w = float(w)
         except Exception:
             w = 0.0
-
         for name, lb_min, lb_max in BUCKETS:
             if lb_max is None:
                 if w >= lb_min:
@@ -95,18 +91,16 @@ def build_workbook(
                     return name
         return BUCKETS[0][0]
 
-    # =========================
-    # Offset summary
-    # =========================
+    # --- offset summary ---
     offset_cnt, offset_amt = {}, {}
     if df_offset is not None and not df_offset.empty:
         need_off = ["快递员ID", "费用合计_未税"]
-        if not all(c in df_offset.columns for c in need_off):
-            raise ValueError(f"冲抵明细缺少列: {[c for c in need_off if c not in df_offset.columns]}")
+        miss_off = [c for c in need_off if c not in df_offset.columns]
+        if miss_off:
+            raise ValueError(f"冲抵明细缺少列: {miss_off}")
         dfo = df_offset.copy()
         dfo["快递员ID"] = dfo["快递员ID"].astype(str).str.strip()
         dfo["费用合计_未税"] = pd.to_numeric(dfo["费用合计_未税"], errors="coerce").fillna(0.0)
-
         g_off = dfo.groupby("快递员ID", dropna=False).agg(
             cnt=("费用合计_未税", "size"),
             amt=("费用合计_未税", "sum"),
@@ -114,14 +108,13 @@ def build_workbook(
         offset_cnt = g_off["cnt"].to_dict()
         offset_amt = g_off["amt"].to_dict()
 
-    # =========================
-    # Claim summary (name -> ID)
-    # =========================
+    # --- claim summary (name->id) ---
     claim_cnt, claim_amt = {}, {}
     if df_claim_raw is not None and not df_claim_raw.empty:
         need_cl = ["快递员", "理赔类型", "费用合计_未税"]
-        if not all(c in df_claim_raw.columns for c in need_cl):
-            raise ValueError(f"理赔明细缺少列: {[c for c in need_cl if c not in df_claim_raw.columns]}")
+        miss_cl = [c for c in need_cl if c not in df_claim_raw.columns]
+        if miss_cl:
+            raise ValueError(f"理赔明细缺少列: {miss_cl}")
 
         name_to_id = (
             df_delivery[[COL_DRIVER, COL_DRIVER_ID]]
@@ -155,7 +148,6 @@ def build_workbook(
             raise ValueError("理赔明细中有快递员在派费明细找不到对应ID: " + ", ".join(missing_names[:50]))
 
         dfc["费用合计_未税"] = pd.to_numeric(dfc["费用合计_未税"], errors="coerce").fillna(0.0)
-
         g_cl = dfc.groupby(["_did", "_dtype"], dropna=False).agg(
             cnt=("费用合计_未税", "size"),
             amt=("费用合计_未税", "sum"),
@@ -164,13 +156,12 @@ def build_workbook(
             claim_cnt[(str(did).strip(), str(dtype).strip())] = int(row["cnt"])
             claim_amt[(str(did).strip(), str(dtype).strip())] = float(row["amt"])
 
-    # =========================
-    # Delivery prep
-    # =========================
+    # --- delivery prep ---
     df = df_delivery.copy()
-    for c in [COL_DRIVER_ID, COL_DRIVER, COL_ROUTE, COL_WEIGHT, COL_TASK, COL_STOP]:
-        if c not in df.columns:
-            raise ValueError(f"派费明细缺少列: {c}")
+    must_cols = [COL_DRIVER_ID, COL_DRIVER, COL_ROUTE, COL_WEIGHT, COL_TASK, COL_STOP]
+    miss = [c for c in must_cols if c not in df.columns]
+    if miss:
+        raise ValueError(f"派费明细缺少列: {miss}")
 
     df[COL_DRIVER_ID] = df[COL_DRIVER_ID].astype(str).str.strip()
     df[COL_DRIVER] = df[COL_DRIVER].astype(str).str.strip()
@@ -207,9 +198,7 @@ def build_workbook(
         headers.append((b, "首票"))
         headers.append((b, "联单"))
 
-    # =========================
-    # Workbook
-    # =========================
+    # --- workbook ---
     wb = Workbook()
     ws = wb.active
     ws.title = "司机汇总"
@@ -222,7 +211,6 @@ def build_workbook(
     pr["联单单价"] = pd.to_numeric(pr["联单单价"], errors="coerce")
     if pr[["首票单价", "联单单价"]].isna().any().any():
         raise ValueError("单价表存在空值/非数字，无法生成。")
-
     pr["匹配键"] = pr["线路"] + "|" + pr["档位"]
 
     ws_route = wb.create_sheet(SHEET_ROUTE)
@@ -230,11 +218,10 @@ def build_workbook(
     for cell in ws_route[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
     for _, row in pr.iterrows():
         ws_route.append([row["线路"], row["档位"], float(row["首票单价"]), float(row["联单单价"]), row["匹配键"]])
 
-    # 可选输出原始明细
+    # 输出原始明细（可对账）
     def write_df_to_sheet(book: Workbook, name: str, dfx: pd.DataFrame):
         wsx = book.create_sheet(name)
         wsx.append(list(dfx.columns))
@@ -362,6 +349,7 @@ def build_workbook(
         ws.cell(r, ded_start_col + 3).value = float(claim_amt.get((did_str, "虚假签收"), 0.0))
         ws.cell(r, ded_start_col + 4).value = int(offset_cnt.get(did_str, 0))
         ws.cell(r, ded_start_col + 5).value = float(offset_amt.get(did_str, 0.0))
+
         ws.cell(r, ded_start_col + 6).value = (
             f"=SUM({get_column_letter(ded_start_col)}{r},"
             f"{get_column_letter(ded_start_col+2)}{r},"
@@ -386,8 +374,9 @@ def build_workbook(
     ws.freeze_panes = "A6"
     return wb
 
+
 # =========================
-# Upload (THIS WAS MISSING IN YOUR SCRIPT)
+# Upload
 # =========================
 uploaded_file = st.file_uploader("Upload salary Excel", type=["xlsx", "csv"])
 if uploaded_file is None:
@@ -397,15 +386,29 @@ if uploaded_file.name.endswith(".csv"):
     st.error("csv 不支持多 sheet，请上传 xlsx")
     st.stop()
 
-# =========================
-# Session state
-# =========================
-st.session_state.setdefault("generated", False)
-st.session_state.setdefault("output_bytes", None)
-st.session_state.setdefault("output_name", None)
+# 上传新文件：清空上次生成
+if st.session_state.get("last_uploaded_name") != uploaded_file.name:
+    st.session_state["last_uploaded_name"] = uploaded_file.name
+    st.session_state["generated"] = False
+    st.session_state["output_bytes"] = None
+    st.session_state["output_name"] = None
 
 # =========================
-# Read workbook once
+# Parse fleet + period (NO USER INPUT)
+# =========================
+fleet_name, period_str = parse_fleet_and_period_from_filename(uploaded_file.name)
+if not fleet_name or not period_str:
+    st.error(
+        "文件名无法解析【车队名称/帐期范围】。\n"
+        "请确保文件名包含格式：<车队>-派费明细-MM_DD_YYYY-MM_DD_YYYY-...xlsx\n"
+        f"当前文件名：{uploaded_file.name}"
+    )
+    st.stop()
+
+st.caption(f"车队：{fleet_name} ｜ 帐期：{period_str}")
+
+# =========================
+# Read workbook
 # =========================
 try:
     xls = pd.ExcelFile(uploaded_file)
@@ -424,7 +427,7 @@ df_delivery.columns = df_delivery.columns.astype(str).str.strip()
 st.subheader("Raw Data Preview (派费明细)")
 st.dataframe(df_delivery.head(50), use_container_width=True)
 
-# auto routes
+# routes from delivery
 COL_ROUTE = "区域/线路"
 if COL_ROUTE not in df_delivery.columns:
     st.error(f"派费明细缺少列: {COL_ROUTE}")
@@ -433,16 +436,6 @@ routes = sorted([r for r in df_delivery[COL_ROUTE].astype(str).fillna("").str.st
 if not routes:
     st.error("未从 派费明细 的“区域/线路”提取到任何线路，请检查源表。")
     st.stop()
-
-# =========================
-# Fleet & period UI
-# =========================
-default_fleet, default_start, default_end = parse_fleet_and_period_from_filename(uploaded_file.name)
-with st.expander("账单信息（车队名称 & 帐期范围）", expanded=True):
-    col1, col2, col3 = st.columns([2, 1, 1])
-    fleet_name = col1.text_input("车队名称", value=default_fleet or "")
-    start_date = col2.date_input("帐期开始", value=default_start or date.today())
-    end_date = col3.date_input("帐期结束", value=default_end or date.today())
 
 # =========================
 # Price table UI (3 tiers)
@@ -473,7 +466,7 @@ if missing_price.any():
     st.warning("单价未填写完整或存在非数字：请补全 首票单价 / 联单单价（否则无法生成账单）")
 
 # =========================
-# Read offset & claim
+# Read offset & claim sheets
 # =========================
 df_offset = pd.DataFrame()
 if SHEET_OFFSET in sheet_names:
@@ -494,12 +487,6 @@ if generate_clicked:
     if missing_price.any():
         st.error("单价未填写完整，无法生成账单。请先补全单价。")
         st.stop()
-    if not fleet_name.strip():
-        st.error("车队名称不能为空（用于输出文件名）。")
-        st.stop()
-    if start_date > end_date:
-        st.error("帐期开始不能晚于帐期结束。")
-        st.stop()
 
     try:
         wb = build_workbook(
@@ -516,18 +503,17 @@ if generate_clicked:
     wb.save(buf)
     buf.seek(0)
 
-    period_str = fmt_period(start_date, end_date)
     out_name = f"{safe_filename(fleet_name)}-{period_str}-工资单.xlsx"
+    st.session_state["generated"] = True
+    st.session_state["output_bytes"] = buf.getvalue()
+    st.session_state["output_name"] = out_name
 
-    st.session_state.generated = True
-    st.session_state.output_bytes = buf.getvalue()
-    st.session_state.output_name = out_name
     st.success("账单已生成，可以下载了。")
 
 # =========================
 # Download (green after generated)
 # =========================
-if st.session_state.generated and st.session_state.output_bytes:
+if st.session_state.get("generated") and st.session_state.get("output_bytes"):
     st.markdown(
         """
         <style>
@@ -547,8 +533,8 @@ if st.session_state.generated and st.session_state.output_bytes:
 
     st.download_button(
         label="⬇️ 下载工资单",
-        data=st.session_state.output_bytes,
-        file_name=st.session_state.output_name or "工资单.xlsx",
+        data=st.session_state["output_bytes"],
+        file_name=st.session_state["output_name"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
