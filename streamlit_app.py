@@ -8,11 +8,14 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
+# =========================
+# Page
+# =========================
 st.set_page_config(page_title="DSP Salary Summary Tool", layout="wide")
 st.title("DSP Salary Summary Tool")
 
 # =========================
-# 常量
+# Constants
 # =========================
 SHEET_DELIVERY = "派费明细"
 SHEET_ROUTE = "参数_线路明细"
@@ -26,7 +29,7 @@ COL_WEIGHT = "结算重量lb"
 COL_TASK = "任务号"
 COL_STOP = "STOP序号"
 
-# 3档重量（不出现“超重件”字样）
+# Weight tiers (no "超重件" word)
 TIERS = ["0-5lb", "5-20lb", "20lb以上"]
 BUCKETS = [
     ("0-5lb", 0, 5),         # [0,5)
@@ -44,20 +47,37 @@ def safe_filename(s: str) -> str:
     return s or "工资单"
 
 def parse_fleet_and_period_from_filename(name: str):
-    # <fleet>-派费明细-02_02_2026-08_02_2026-...xlsx
-    m_fleet = re.search(r"^(.*?)-派费明细-", name or "")
-    m_period = re.search(r"(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})", name or "")
-    fleet = m_fleet.group(1).strip() if m_fleet else None
+    """
+    filename example:
+      SEA-ZEP-派费明细-09_02_2026-15_02_2026-GOFO.xlsx
 
-    period = None
-    if m_period:
-        p1, p2 = m_period.group(1), m_period.group(2)
+    date format supports:
+      - MM_DD_YYYY
+      - DD_MM_YYYY  (your sample)
+    """
+    if not name:
+        return None, None
+
+    m_fleet = re.search(r"^(.*?)-派费明细-", name)
+    m_period = re.search(r"(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})", name)
+
+    fleet = m_fleet.group(1).strip() if m_fleet else None
+    if not m_period:
+        return fleet, None
+
+    p1, p2 = m_period.group(1), m_period.group(2)
+
+    ok = False
+    for fmt in ("%m_%d_%Y", "%d_%m_%Y"):
         try:
-            datetime.strptime(p1, "%m_%d_%Y")
-            datetime.strptime(p2, "%m_%d_%Y")
-            period = f"{p1}-{p2}"
+            datetime.strptime(p1, fmt)
+            datetime.strptime(p2, fmt)
+            ok = True
+            break
         except Exception:
-            period = None
+            pass
+
+    period = f"{p1}-{p2}" if ok else None
     return fleet, period
 
 def weight_bucket(w):
@@ -75,7 +95,7 @@ def weight_bucket(w):
     return BUCKETS[0][0]
 
 # =========================
-# build_workbook（你原逻辑已整合）
+# Workbook builder
 # =========================
 def build_workbook(
     df_delivery: pd.DataFrame,
@@ -102,7 +122,7 @@ def build_workbook(
         offset_cnt = g_off["cnt"].to_dict()
         offset_amt = g_off["amt"].to_dict()
 
-    # --- claim summary (name->id) ---
+    # --- claim summary (name -> id) ---
     claim_cnt, claim_amt = {}, {}
     if df_claim_raw is not None and not df_claim_raw.empty:
         need_cl = ["快递员", "理赔类型", "费用合计_未税"]
@@ -163,10 +183,12 @@ def build_workbook(
     df["_weight"] = pd.to_numeric(df[COL_WEIGHT], errors="coerce").fillna(0.0)
     df["_bucket"] = df["_weight"].apply(weight_bucket)
 
+    # 首票/联单：同 driver + 任务号 + STOP序号，第一条首票，其余联单
     gkey = [COL_DRIVER_ID, COL_TASK, COL_STOP]
     df["_rank_in_stop"] = df.groupby(gkey).cumcount() + 1
     df["_ticket"] = df["_rank_in_stop"].eq(1).map({True: "首票", False: "联单"})
 
+    # 件数统计：driver + route + bucket + ticket
     cnt = (
         df.groupby([COL_DRIVER_ID, COL_DRIVER, "_route", "_bucket", "_ticket"], dropna=False)
           .size().reset_index(name="件数")
@@ -181,12 +203,14 @@ def build_workbook(
         ]
         return 0 if m.empty else int(m.iloc[0]["件数"])
 
+    # 一行一个 driver + route
     drivers = (
         df[[COL_DRIVER_ID, COL_DRIVER, "_route"]]
         .drop_duplicates()
         .sort_values(["_route", COL_DRIVER])
     )
 
+    # headers：每个档位各 2 组（首票/联单），每组 2 列（件数/金额）
     headers = []
     for b in [x[0] for x in BUCKETS]:
         headers.append((b, "首票"))
@@ -197,7 +221,7 @@ def build_workbook(
     ws = wb.active
     ws.title = "司机汇总"
 
-    # 参数_线路明细
+    # 参数_线路明细（单价来源）
     pr = df_route_price.copy()
     pr["线路"] = pr["线路"].astype(str).str.strip()
     pr["档位"] = pr["档位"].astype(str).str.strip()
@@ -212,10 +236,11 @@ def build_workbook(
     for cell in ws_route[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
     for _, row in pr.iterrows():
         ws_route.append([row["线路"], row["档位"], float(row["首票单价"]), float(row["联单单价"]), row["匹配键"]])
 
-    # 可选输出原始明细
+    # （可选）把明细写进 output 方便对账
     def write_df_to_sheet(book: Workbook, name: str, dfx: pd.DataFrame):
         wsx = book.create_sheet(name)
         wsx.append(list(dfx.columns))
@@ -230,7 +255,9 @@ def build_workbook(
     if df_claim_raw is not None and not df_claim_raw.empty:
         write_df_to_sheet(wb, SHEET_CLAIM, df_claim_raw)
 
+    # =========================
     # Styles
+    # =========================
     thin = Side(style="thin", color="666666")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -241,6 +268,7 @@ def build_workbook(
     fill_sub = PatternFill("solid", fgColor="F7E6D8")
     fill_blue = PatternFill("solid", fgColor="D9E1F2")
 
+    # 扣款块：断更、虚假签收、冲抵、合计
     ded_blocks = ["断更", "虚假签收", "冲抵", "合计"]
     last_col_guess = 5 + len(headers) * 2 + 2 + len(ded_blocks) * 2
 
@@ -249,6 +277,7 @@ def build_workbook(
     ws.cell(1, 1).font = title_font
     ws.cell(1, 1).alignment = center
 
+    # A顺号 B快递员 C金额 D件数 E线路
     ws.merge_cells("A3:A5"); ws["A3"].value = "顺号"
     ws.merge_cells("B3:B5"); ws["B3"].value = "快递员"
     ws.merge_cells("C3:D3"); ws["C3"].value = "应付工资"
@@ -256,7 +285,7 @@ def build_workbook(
     ws.merge_cells("D4:D5"); ws["D4"].value = "件数"
     ws.merge_cells("E3:E5"); ws["E3"].value = "线路"
 
-    start_col = 6
+    start_col = 6  # F
     end_delivery_col = start_col + len(headers) * 2 - 1
     ws.merge_cells(start_row=3, start_column=start_col, end_row=3, end_column=end_delivery_col)
     ws.cell(3, start_col).value = "送货工资"
@@ -269,6 +298,7 @@ def build_workbook(
         ws.cell(5, col + 1).value = "金额"
         col += 2
 
+    # 送货合计
     ws.merge_cells(start_row=4, start_column=col, end_row=4, end_column=col + 1)
     ws.cell(4, col).value = "送货合计"
     ws.cell(5, col).value = "件数"
@@ -277,8 +307,10 @@ def build_workbook(
     delivery_total_amt_col = col + 1
     col += 2
 
+    # 扣款块
     ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=col + len(ded_blocks) * 2 - 1)
     ws.cell(3, col).value = "工资扣款"
+
     for i, name in enumerate(ded_blocks):
         ws.merge_cells(start_row=4, start_column=col + i * 2, end_row=4, end_column=col + i * 2 + 1)
         ws.cell(4, col + i * 2).value = name
@@ -289,6 +321,7 @@ def build_workbook(
     ded_total_cnt_col = col + (len(ded_blocks) - 1) * 2
     ded_total_amt_col = ded_total_cnt_col + 1
 
+    # Header styles
     for rr in range(3, 6):
         ws.row_dimensions[rr].height = 22
         for cc in range(1, ded_total_amt_col + 1):
@@ -298,27 +331,33 @@ def build_workbook(
             cell.border = border
             cell.fill = fill_head if rr == 3 else fill_sub
 
+    # Column widths
     ws.column_dimensions["A"].width = 6
     ws.column_dimensions["B"].width = 28
     ws.column_dimensions["C"].width = 14
     ws.column_dimensions["D"].width = 10
     ws.column_dimensions["E"].width = 14
 
+    # =========================
+    # Write rows
+    # =========================
     row_start = 6
     for idx, (did, dname, route) in enumerate(drivers.itertuples(index=False), start=1):
         r = row_start + idx - 1
+
         ws.cell(r, 1).value = idx
         ws.cell(r, 2).value = f"{dname} ({did})"
         ws.cell(r, 5).value = route
 
         c = start_col
-        delivery_cnt_cells, delivery_amt_cells = [], []
+        delivery_cnt_cells = []
+        delivery_amt_cells = []
 
         for (bucket, ticket) in headers:
             cnt_val = get_cnt(did, route, bucket, ticket)
             ws.cell(r, c).value = cnt_val
 
-            col_idx = 3 if ticket == "首票" else 4
+            col_idx = 3 if ticket == "首票" else 4  # 参数_线路明细: C=3 D=4
             formula = (
                 f'=IFERROR('
                 f'{get_column_letter(c)}{r}*'
@@ -333,14 +372,19 @@ def build_workbook(
             delivery_amt_cells.append(f"{get_column_letter(c + 1)}{r}")
             c += 2
 
+        # 送货合计
         ws.cell(r, delivery_total_cnt_col).value = f"=SUM({','.join(delivery_cnt_cells)})"
         ws.cell(r, delivery_total_amt_col).value = f"=SUM({','.join(delivery_amt_cells)})"
 
+        # 扣款：断更/虚假签收/冲抵 + 合计
         did_str = str(did).strip()
+
         ws.cell(r, ded_start_col + 0).value = claim_cnt.get((did_str, "断更"), 0)
         ws.cell(r, ded_start_col + 1).value = float(claim_amt.get((did_str, "断更"), 0.0))
+
         ws.cell(r, ded_start_col + 2).value = claim_cnt.get((did_str, "虚假签收"), 0)
         ws.cell(r, ded_start_col + 3).value = float(claim_amt.get((did_str, "虚假签收"), 0.0))
+
         ws.cell(r, ded_start_col + 4).value = int(offset_cnt.get(did_str, 0))
         ws.cell(r, ded_start_col + 5).value = float(offset_amt.get(did_str, 0.0))
 
@@ -355,9 +399,11 @@ def build_workbook(
             f"{get_column_letter(ded_start_col+5)}{r})"
         )
 
+        # 应付工资：件数=送货合计件数；金额=送货合计金额-扣款合计金额
         ws.cell(r, 4).value = f"={get_column_letter(delivery_total_cnt_col)}{r}"
         ws.cell(r, 3).value = f"={get_column_letter(delivery_total_amt_col)}{r}-{get_column_letter(ded_total_amt_col)}{r}"
 
+        # Row styles
         for cc in range(1, ded_total_amt_col + 1):
             cell = ws.cell(r, cc)
             cell.alignment = center
@@ -368,7 +414,6 @@ def build_workbook(
     ws.freeze_panes = "A6"
     return wb
 
-
 # =========================
 # Session state
 # =========================
@@ -378,36 +423,36 @@ st.session_state.setdefault("output_name", None)
 st.session_state.setdefault("last_uploaded_name", None)
 
 # =========================
-# 1) 上传文件
+# Upload
 # =========================
 uploaded_file = st.file_uploader("Upload salary Excel (xlsx)", type=["xlsx"])
 if uploaded_file is None:
     st.info("请先上传 xlsx 文件。")
     st.stop()
 
-# 上传新文件：清空上次生成
+# New file => reset
 if st.session_state["last_uploaded_name"] != uploaded_file.name:
     st.session_state["last_uploaded_name"] = uploaded_file.name
     st.session_state["generated"] = False
     st.session_state["output_bytes"] = None
     st.session_state["output_name"] = None
 
-# 车队&帐期（只读，从文件名读）
+# Parse fleet & period (read-only)
 fleet_name, period_str = parse_fleet_and_period_from_filename(uploaded_file.name)
 if not fleet_name or not period_str:
     st.error(
         "文件名无法解析【车队名称/帐期范围】。\n"
-        "请确保文件名格式：<车队>-派费明细-MM_DD_YYYY-MM_DD_YYYY-...xlsx\n"
+        "请确保文件名格式：<车队>-派费明细-MM_DD_YYYY-MM_DD_YYYY-...xlsx（也支持DD_MM_YYYY）\n"
         f"当前文件名：{uploaded_file.name}"
     )
     st.stop()
+
 st.caption(f"车队：{fleet_name} ｜ 帐期：{period_str}")
 
 # =========================
-# 2) 仅提取 routes（轻量读取一次Excel）
+# Only extract routes (light read)
 # =========================
 try:
-    # 只读需要的列，减少开销
     df_routes_only = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY, usecols=[COL_ROUTE])
     df_routes_only.columns = df_routes_only.columns.astype(str).str.strip()
 except Exception as e:
@@ -422,7 +467,7 @@ if not routes:
 st.caption(f"已识别线路数：{len(routes)}")
 
 # =========================
-# 3) 价格输入：用 form（不点按钮不生成）
+# Price form (submit then run heavy)
 # =========================
 base_rows = [{"线路": r, "档位": t, "首票单价": 0.0, "联单单价": 0.0} for r in routes for t in TIERS]
 df_price = pd.DataFrame(base_rows)
@@ -443,18 +488,19 @@ with st.form("price_form", clear_on_submit=False):
     submit = st.form_submit_button("✅ 确认生成账单", type="primary", use_container_width=True)
 
 # =========================
-# 4) 点按钮后才做：读全部sheet + 计算 + 生成
+# Heavy work only after submit
 # =========================
 if submit:
     df_route_price = edited_df.copy()
     df_route_price["首票单价"] = pd.to_numeric(df_route_price["首票单价"], errors="coerce")
     df_route_price["联单单价"] = pd.to_numeric(df_route_price["联单单价"], errors="coerce")
+
     missing_price = df_route_price["首票单价"].isna() | df_route_price["联单单价"].isna()
     if missing_price.any():
         st.error("单价未填写完整或存在非数字，无法生成账单。")
         st.stop()
 
-    # 现在开始读完整数据（重活都在这里）
+    # Read full workbook
     try:
         xls = pd.ExcelFile(uploaded_file)
         sheet_names = xls.sheet_names
@@ -498,10 +544,11 @@ if submit:
     st.session_state["generated"] = True
     st.session_state["output_bytes"] = buf.getvalue()
     st.session_state["output_name"] = out_name
+
     st.success("账单已生成，可以下载了。")
 
 # =========================
-# 5) 下载按钮：生成后变绿
+# Download (green after generated)
 # =========================
 if st.session_state.get("generated") and st.session_state.get("output_bytes"):
     st.markdown(
