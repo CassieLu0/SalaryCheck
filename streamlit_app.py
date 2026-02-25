@@ -12,12 +12,27 @@ st.set_page_config(page_title="DSP Salary Summary Tool", layout="wide")
 st.title("DSP Salary Summary Tool")
 
 # =========================
-# Sheet names (constants)
+# 常量
 # =========================
 SHEET_DELIVERY = "派费明细"
 SHEET_ROUTE = "参数_线路明细"
 SHEET_OFFSET = "冲抵明细"
 SHEET_CLAIM = "理赔明细"
+
+COL_DRIVER_ID = "快递员ID"
+COL_DRIVER = "快递员"
+COL_ROUTE = "区域/线路"
+COL_WEIGHT = "结算重量lb"
+COL_TASK = "任务号"
+COL_STOP = "STOP序号"
+
+# 3档重量（不出现“超重件”字样）
+TIERS = ["0-5lb", "5-20lb", "20lb以上"]
+BUCKETS = [
+    ("0-5lb", 0, 5),         # [0,5)
+    ("5-20lb", 5, 20),       # [5,20)
+    ("20lb以上", 20, None),   # [20, +inf)
+]
 
 # =========================
 # Helpers
@@ -29,68 +44,45 @@ def safe_filename(s: str) -> str:
     return s or "工资单"
 
 def parse_fleet_and_period_from_filename(name: str):
-    """
-    Expect filename like:
-      <fleet>-派费明细-02_02_2026-08_02_2026-...xlsx
-
-    Return (fleet, "02_02_2026-08_02_2026") or (None, None) if parse fails.
-    """
-    if not name:
-        return None, None
-
-    m_fleet = re.search(r"^(.*?)-派费明细-", name)
-    m_period = re.search(r"(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})", name)
-
+    # <fleet>-派费明细-02_02_2026-08_02_2026-...xlsx
+    m_fleet = re.search(r"^(.*?)-派费明细-", name or "")
+    m_period = re.search(r"(\d{2}_\d{2}_\d{4})-(\d{2}_\d{2}_\d{4})", name or "")
     fleet = m_fleet.group(1).strip() if m_fleet else None
+
+    period = None
     if m_period:
         p1, p2 = m_period.group(1), m_period.group(2)
-        # validate date format strictly
         try:
             datetime.strptime(p1, "%m_%d_%Y")
             datetime.strptime(p2, "%m_%d_%Y")
             period = f"{p1}-{p2}"
         except Exception:
             period = None
-    else:
-        period = None
-
     return fleet, period
 
+def weight_bucket(w):
+    try:
+        w = float(w)
+    except Exception:
+        w = 0.0
+    for name, lb_min, lb_max in BUCKETS:
+        if lb_max is None:
+            if w >= lb_min:
+                return name
+        else:
+            if lb_min <= w < lb_max:
+                return name
+    return BUCKETS[0][0]
+
+# =========================
+# build_workbook（你原逻辑已整合）
+# =========================
 def build_workbook(
     df_delivery: pd.DataFrame,
     df_route_price: pd.DataFrame,
     df_offset: pd.DataFrame,
     df_claim_raw: pd.DataFrame | None,
 ):
-    # Columns mapping
-    COL_DRIVER_ID = "快递员ID"
-    COL_DRIVER = "快递员"
-    COL_ROUTE = "区域/线路"
-    COL_WEIGHT = "结算重量lb"
-    COL_TASK = "任务号"
-    COL_STOP = "STOP序号"
-
-    # Weight buckets (3 tiers)
-    BUCKETS = [
-        ("0-5lb", 0, 5),         # [0,5)
-        ("5-20lb", 5, 20),       # [5,20)
-        ("20lb以上", 20, None),   # [20, +inf)
-    ]
-
-    def weight_bucket(w):
-        try:
-            w = float(w)
-        except Exception:
-            w = 0.0
-        for name, lb_min, lb_max in BUCKETS:
-            if lb_max is None:
-                if w >= lb_min:
-                    return name
-            else:
-                if lb_min <= w < lb_max:
-                    return name
-        return BUCKETS[0][0]
-
     # --- offset summary ---
     offset_cnt, offset_amt = {}, {}
     if df_offset is not None and not df_offset.empty:
@@ -98,9 +90,11 @@ def build_workbook(
         miss_off = [c for c in need_off if c not in df_offset.columns]
         if miss_off:
             raise ValueError(f"冲抵明细缺少列: {miss_off}")
+
         dfo = df_offset.copy()
         dfo["快递员ID"] = dfo["快递员ID"].astype(str).str.strip()
         dfo["费用合计_未税"] = pd.to_numeric(dfo["费用合计_未税"], errors="coerce").fillna(0.0)
+
         g_off = dfo.groupby("快递员ID", dropna=False).agg(
             cnt=("费用合计_未税", "size"),
             amt=("费用合计_未税", "sum"),
@@ -221,7 +215,7 @@ def build_workbook(
     for _, row in pr.iterrows():
         ws_route.append([row["线路"], row["档位"], float(row["首票单价"]), float(row["联单单价"]), row["匹配键"]])
 
-    # 输出原始明细（可对账）
+    # 可选输出原始明细
     def write_df_to_sheet(book: Workbook, name: str, dfx: pd.DataFrame):
         wsx = book.create_sheet(name)
         wsx.append(list(dfx.columns))
@@ -376,117 +370,114 @@ def build_workbook(
 
 
 # =========================
-# Upload
+# Session state
 # =========================
-uploaded_file = st.file_uploader("Upload salary Excel", type=["xlsx", "csv"])
+st.session_state.setdefault("generated", False)
+st.session_state.setdefault("output_bytes", None)
+st.session_state.setdefault("output_name", None)
+st.session_state.setdefault("last_uploaded_name", None)
+
+# =========================
+# 1) 上传文件
+# =========================
+uploaded_file = st.file_uploader("Upload salary Excel (xlsx)", type=["xlsx"])
 if uploaded_file is None:
     st.info("请先上传 xlsx 文件。")
     st.stop()
-if uploaded_file.name.endswith(".csv"):
-    st.error("csv 不支持多 sheet，请上传 xlsx")
-    st.stop()
 
 # 上传新文件：清空上次生成
-if st.session_state.get("last_uploaded_name") != uploaded_file.name:
+if st.session_state["last_uploaded_name"] != uploaded_file.name:
     st.session_state["last_uploaded_name"] = uploaded_file.name
     st.session_state["generated"] = False
     st.session_state["output_bytes"] = None
     st.session_state["output_name"] = None
 
-# =========================
-# Parse fleet + period (NO USER INPUT)
-# =========================
+# 车队&帐期（只读，从文件名读）
 fleet_name, period_str = parse_fleet_and_period_from_filename(uploaded_file.name)
 if not fleet_name or not period_str:
     st.error(
         "文件名无法解析【车队名称/帐期范围】。\n"
-        "请确保文件名包含格式：<车队>-派费明细-MM_DD_YYYY-MM_DD_YYYY-...xlsx\n"
+        "请确保文件名格式：<车队>-派费明细-MM_DD_YYYY-MM_DD_YYYY-...xlsx\n"
         f"当前文件名：{uploaded_file.name}"
     )
     st.stop()
-
 st.caption(f"车队：{fleet_name} ｜ 帐期：{period_str}")
 
 # =========================
-# Read workbook
+# 2) 仅提取 routes（轻量读取一次Excel）
 # =========================
 try:
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
+    # 只读需要的列，减少开销
+    df_routes_only = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY, usecols=[COL_ROUTE])
+    df_routes_only.columns = df_routes_only.columns.astype(str).str.strip()
 except Exception as e:
-    st.error(f"无法读取Excel：{e}")
+    st.error(f"无法读取Excel或缺少列 {COL_ROUTE}：{e}")
     st.stop()
 
-if SHEET_DELIVERY not in sheet_names:
-    st.error(f"缺少工作表：{SHEET_DELIVERY}；当前sheet：{sheet_names}")
-    st.stop()
-
-df_delivery = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
-df_delivery.columns = df_delivery.columns.astype(str).str.strip()
-
-st.subheader("Raw Data Preview (派费明细)")
-st.dataframe(df_delivery.head(50), use_container_width=True)
-
-# routes from delivery
-COL_ROUTE = "区域/线路"
-if COL_ROUTE not in df_delivery.columns:
-    st.error(f"派费明细缺少列: {COL_ROUTE}")
-    st.stop()
-routes = sorted([r for r in df_delivery[COL_ROUTE].astype(str).fillna("").str.strip().unique().tolist() if r])
+routes = sorted([r for r in df_routes_only[COL_ROUTE].astype(str).fillna("").str.strip().unique().tolist() if r])
 if not routes:
     st.error("未从 派费明细 的“区域/线路”提取到任何线路，请检查源表。")
     st.stop()
 
-# =========================
-# Price table UI (3 tiers)
-# =========================
-tiers = ["0-5lb", "5-20lb", "20lb以上"]
-st.subheader("线路单价 (输入价格)")
+st.caption(f"已识别线路数：{len(routes)}")
 
-base_rows = [{"线路": r, "档位": t, "首票单价": 0.0, "联单单价": 0.0} for r in routes for t in tiers]
+# =========================
+# 3) 价格输入：用 form（不点按钮不生成）
+# =========================
+base_rows = [{"线路": r, "档位": t, "首票单价": 0.0, "联单单价": 0.0} for r in routes for t in TIERS]
 df_price = pd.DataFrame(base_rows)
 
-edited_df = st.data_editor(
-    df_price,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "线路": st.column_config.TextColumn("线路", disabled=True),
-        "档位": st.column_config.TextColumn("档位", disabled=True),
-        "首票单价": st.column_config.NumberColumn("首票单价", min_value=0.0, step=0.01, format="%.2f"),
-        "联单单价": st.column_config.NumberColumn("联单单价", min_value=0.0, step=0.01, format="%.2f"),
-    },
-)
-
-df_route_price = edited_df.copy()
-df_route_price["首票单价"] = pd.to_numeric(df_route_price["首票单价"], errors="coerce")
-df_route_price["联单单价"] = pd.to_numeric(df_route_price["联单单价"], errors="coerce")
-missing_price = df_route_price["首票单价"].isna() | df_route_price["联单单价"].isna()
-if missing_price.any():
-    st.warning("单价未填写完整或存在非数字：请补全 首票单价 / 联单单价（否则无法生成账单）")
+with st.form("price_form", clear_on_submit=False):
+    st.subheader("线路单价（填完后点确认才生成账单）")
+    edited_df = st.data_editor(
+        df_price,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "线路": st.column_config.TextColumn("线路", disabled=True),
+            "档位": st.column_config.TextColumn("档位", disabled=True),
+            "首票单价": st.column_config.NumberColumn("首票单价", min_value=0.0, step=0.01, format="%.2f"),
+            "联单单价": st.column_config.NumberColumn("联单单价", min_value=0.0, step=0.01, format="%.2f"),
+        },
+    )
+    submit = st.form_submit_button("✅ 确认生成账单", type="primary", use_container_width=True)
 
 # =========================
-# Read offset & claim sheets
+# 4) 点按钮后才做：读全部sheet + 计算 + 生成
 # =========================
-df_offset = pd.DataFrame()
-if SHEET_OFFSET in sheet_names:
-    df_offset = pd.read_excel(uploaded_file, sheet_name=SHEET_OFFSET)
-    df_offset.columns = df_offset.columns.astype(str).str.strip()
-
-df_claim_raw = None
-if SHEET_CLAIM in sheet_names:
-    df_claim_raw = pd.read_excel(uploaded_file, sheet_name=SHEET_CLAIM)
-    df_claim_raw.columns = df_claim_raw.columns.astype(str).str.strip()
-
-# =========================
-# Generate button
-# =========================
-generate_clicked = st.button("✅ 确认生成账单", type="primary", use_container_width=True)
-
-if generate_clicked:
+if submit:
+    df_route_price = edited_df.copy()
+    df_route_price["首票单价"] = pd.to_numeric(df_route_price["首票单价"], errors="coerce")
+    df_route_price["联单单价"] = pd.to_numeric(df_route_price["联单单价"], errors="coerce")
+    missing_price = df_route_price["首票单价"].isna() | df_route_price["联单单价"].isna()
     if missing_price.any():
-        st.error("单价未填写完整，无法生成账单。请先补全单价。")
+        st.error("单价未填写完整或存在非数字，无法生成账单。")
         st.stop()
+
+    # 现在开始读完整数据（重活都在这里）
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+        sheet_names = xls.sheet_names
+    except Exception as e:
+        st.error(f"无法读取Excel：{e}")
+        st.stop()
+
+    if SHEET_DELIVERY not in sheet_names:
+        st.error(f"缺少工作表：{SHEET_DELIVERY}；当前sheet：{sheet_names}")
+        st.stop()
+
+    df_delivery = pd.read_excel(uploaded_file, sheet_name=SHEET_DELIVERY)
+    df_delivery.columns = df_delivery.columns.astype(str).str.strip()
+
+    df_offset = pd.DataFrame()
+    if SHEET_OFFSET in sheet_names:
+        df_offset = pd.read_excel(uploaded_file, sheet_name=SHEET_OFFSET)
+        df_offset.columns = df_offset.columns.astype(str).str.strip()
+
+    df_claim_raw = None
+    if SHEET_CLAIM in sheet_names:
+        df_claim_raw = pd.read_excel(uploaded_file, sheet_name=SHEET_CLAIM)
+        df_claim_raw.columns = df_claim_raw.columns.astype(str).str.strip()
 
     try:
         wb = build_workbook(
@@ -507,11 +498,10 @@ if generate_clicked:
     st.session_state["generated"] = True
     st.session_state["output_bytes"] = buf.getvalue()
     st.session_state["output_name"] = out_name
-
     st.success("账单已生成，可以下载了。")
 
 # =========================
-# Download (green after generated)
+# 5) 下载按钮：生成后变绿
 # =========================
 if st.session_state.get("generated") and st.session_state.get("output_bytes"):
     st.markdown(
