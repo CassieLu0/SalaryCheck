@@ -451,11 +451,12 @@ def build_workbook(
     # -------------------------
     # 方便查询：driver,bucket,ticket -> (cnt,amt)
     lookup = {}
-    for row in cnt_driver.itertuples(index=False):
-        did = str(getattr(row, COL_DRIVER_ID)).strip()
-        bucket = str(getattr(row, "_bucket")).strip()
-        ticket = str(getattr(row, "_ticket")).strip()
-        lookup[(did, bucket, ticket)] = (int(getattr(row, "件数")), float(getattr(row, "金额")))
+        for _, rr in cnt_driver.iterrows():
+    did = str(rr[COL_DRIVER_ID]).strip()
+    bucket = str(rr["_bucket"]).strip()
+    ticket = str(rr["_ticket"]).strip()
+    lookup[(did, bucket, ticket)] = (int(rr["件数"]), float(rr["金额"]))
+
 
     row_start = 6
     for idx, did in enumerate(all_dids, start=1):
