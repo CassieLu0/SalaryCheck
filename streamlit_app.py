@@ -104,18 +104,29 @@ def build_workbook(
     df_claim_raw: pd.DataFrame | None,
     max_claim_types: int = 20,
 ):
+    """
+    ✅ 修复点：
+    1) drivers = 派费司机 ∪ 冲抵司机 ∪ 理赔司机（支持“只有扣款没有派费”的司机也出现在汇总里）
+    2) 同司机多线路：扣款/理赔只写在该司机第一行，避免重复
+    3) 理赔类型不丢：除“轨迹断更/虚假签收”外，其他类型保留原字样并动态出列
+    4) 金额符号完全跟随源表：数字是什么就怎么算（不abs、不强制取负）
+    """
     # -------------------------
-    # 1) 基础校验 & 预处理
+    # 0) 基础校验
     # -------------------------
     must_cols = [COL_DRIVER_ID, COL_DRIVER, COL_ROUTE, COL_WEIGHT, COL_TASK, COL_STOP]
     miss = [c for c in must_cols if c not in df_delivery.columns]
     if miss:
         raise ValueError(f"派费明细缺少列: {miss}")
 
+    # -------------------------
+    # 1) 派费明细：route / bucket / ticket / cnt
+    # -------------------------
     df = df_delivery.copy()
     df[COL_DRIVER_ID] = df[COL_DRIVER_ID].astype(str).str.strip()
     df[COL_DRIVER] = df[COL_DRIVER].astype(str).str.strip()
-    df["route"] = df[COL_ROUTE].astype(str).fillna("").str.strip()   # ✅不再用 _route
+    df["route"] = df[COL_ROUTE].astype(str).fillna("").str.strip()
+
     df["_weight"] = pd.to_numeric(df[COL_WEIGHT], errors="coerce").fillna(0.0)
     df["_bucket"] = df["_weight"].apply(weight_bucket)
 
@@ -138,7 +149,7 @@ def build_workbook(
         return 0 if m.empty else int(m.iloc[0]["件数"])
 
     # -------------------------
-    # 2) 冲抵汇总（按司机ID）
+    # 2) 冲抵汇总（按司机ID；符号跟随源表）
     # -------------------------
     offset_cnt, offset_amt = {}, {}
     offset_dids = set()
@@ -159,15 +170,16 @@ def build_workbook(
         )
         offset_cnt = g_off["cnt"].to_dict()
         offset_amt = g_off["amt"].to_dict()
-        offset_dids = set(g_off.index.astype(str).str.strip().tolist())
+        offset_dids = set(str(x).strip() for x in g_off.index.tolist())
 
     # -------------------------
-    # 3) 理赔汇总（按司机ID；理赔类型动态列）
+    # 3) 理赔汇总（按司机ID；符号跟随源表；类型动态列）
     # -------------------------
     claim_cnt, claim_amt = {}, {}
     claim_dids = set()
     unmatched_claim = pd.DataFrame()
 
+    # name -> most common id from delivery (用于理赔表没ID的情况)
     name_to_id = (
         df_delivery[[COL_DRIVER, COL_DRIVER_ID]]
         .dropna()
@@ -209,7 +221,6 @@ def build_workbook(
             cnt=("费用合计_未税", "size"),
             amt=("费用合计_未税", "sum"),
         )
-
         for (did, dtype), row in g_cl.iterrows():
             did_s = str(did).strip()
             dtype_s = str(dtype).strip()
@@ -218,14 +229,15 @@ def build_workbook(
 
         claim_dids = set(dfc_ok["_did"].unique().tolist())
 
+    # 动态理赔类型（可限制数量，防止爆表）
     claim_types = sorted({dtype for (_, dtype) in claim_cnt.keys()})
     if len(claim_types) > max_claim_types:
-        type_sum = {}
+        # 按类型总金额绝对值排序，取前N，其余并到“其他”
+        type_sum_abs = {}
         for (did, dtype), amt in claim_amt.items():
-            type_sum[dtype] = type_sum.get(dtype, 0.0) + float(amt)
-        top_types = [t for t, _ in sorted(type_sum.items(), key=lambda x: x[1], reverse=True)[:max_claim_types]]
+            type_sum_abs[dtype] = type_sum_abs.get(dtype, 0.0) + abs(float(amt))
+        top_types = [t for t, _ in sorted(type_sum_abs.items(), key=lambda x: x[1], reverse=True)[:max_claim_types]]
 
-        # 合并到“其他”
         for (did, dtype) in list(claim_cnt.keys()):
             if dtype not in top_types:
                 claim_cnt[(did, "其他")] = claim_cnt.get((did, "其他"), 0) + claim_cnt[(did, dtype)]
@@ -238,41 +250,41 @@ def build_workbook(
             claim_types.append("其他")
 
     # -------------------------
-    # 4) drivers：派费司机 ∪ 冲抵司机 ∪ 理赔司机
-    #    扣款只写到该司机第一行
+    # 4) drivers_rows：派费司机(司机×线路) ∪ 冲抵司机 ∪ 理赔司机
+    #    且：扣款只写第一行
     # -------------------------
     delivery_drivers = (
         df[[COL_DRIVER_ID, COL_DRIVER, "route"]]
         .drop_duplicates()
         .sort_values(["route", COL_DRIVER])
-    )
+    ).copy()
 
     delivery_dids = set(delivery_drivers[COL_DRIVER_ID].astype(str).str.strip().tolist())
     all_dids = sorted(delivery_dids | offset_dids | claim_dids)
 
-    drivers_rows = delivery_drivers.copy()
-
-    extra_dids = [d for d in all_dids if d not in delivery_dids]
-    if extra_dids:
-        did_to_name = (
-            df_delivery[[COL_DRIVER_ID, COL_DRIVER]]
-            .dropna()
-            .assign(**{
-                COL_DRIVER_ID: lambda x: x[COL_DRIVER_ID].astype(str).str.strip(),
-                COL_DRIVER: lambda x: x[COL_DRIVER].astype(str).str.strip(),
-            })
-            .groupby(COL_DRIVER_ID)[COL_DRIVER]
-            .agg(lambda s: s.value_counts().index[0])
-            .to_dict()
-        )
-        extra = pd.DataFrame({
-            COL_DRIVER_ID: extra_dids,
-            COL_DRIVER: [did_to_name.get(d, "UNKNOWN") for d in extra_dids],
-            "route": ["" for _ in extra_dids],
+    # did -> most common name (优先派费明细)
+    did_to_name = (
+        df_delivery[[COL_DRIVER_ID, COL_DRIVER]]
+        .dropna()
+        .assign(**{
+            COL_DRIVER_ID: lambda x: x[COL_DRIVER_ID].astype(str).str.strip(),
+            COL_DRIVER: lambda x: x[COL_DRIVER].astype(str).str.strip(),
         })
-        drivers_rows = pd.concat([drivers_rows, extra], ignore_index=True)
+        .groupby(COL_DRIVER_ID)[COL_DRIVER]
+        .agg(lambda s: s.value_counts().index[0])
+        .to_dict()
+    )
 
-    drivers_rows["is_first_row"] = drivers_rows.groupby(COL_DRIVER_ID).cumcount().eq(0)  # ✅不再用 _is_first_row
+    # 补充：仅扣款无派费
+    extra_dids = [d for d in all_dids if d not in delivery_dids]
+    extra = pd.DataFrame({
+        COL_DRIVER_ID: extra_dids,
+        COL_DRIVER: [did_to_name.get(d, "UNKNOWN") for d in extra_dids],
+        "route": ["" for _ in extra_dids],
+    })
+
+    drivers_rows = pd.concat([delivery_drivers, extra], ignore_index=True)
+    drivers_rows["is_first_row"] = drivers_rows.groupby(COL_DRIVER_ID).cumcount().eq(0)
 
     # -------------------------
     # 5) Workbook + 参数_线路明细
@@ -298,6 +310,7 @@ def build_workbook(
     for _, row in pr.iterrows():
         ws_route.append([row["线路"], row["档位"], float(row["首票单价"]), float(row["联单单价"]), row["匹配键"]])
 
+    # 输出原始明细方便对账
     def write_df_to_sheet(book: Workbook, name: str, dfx: pd.DataFrame):
         wsx = book.create_sheet(name)
         wsx.append(list(dfx.columns))
@@ -315,7 +328,7 @@ def build_workbook(
         write_df_to_sheet(wb, "理赔_未匹配", unmatched_claim)
 
     # -------------------------
-    # 6) 表头（扣款块动态）
+    # 6) 样式 & 表头（扣款块动态）
     # -------------------------
     thin = Side(style="thin", color="666666")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -327,15 +340,16 @@ def build_workbook(
     fill_sub = PatternFill("solid", fgColor="F7E6D8")
     fill_blue = PatternFill("solid", fgColor="D9E1F2")
 
+    # 送货 headers
     headers = []
     for b in [x[0] for x in BUCKETS]:
         headers.append((b, "首票"))
         headers.append((b, "联单"))
 
+    # 扣款 blocks：理赔类型 + 冲抵 + 合计
     ded_blocks = claim_types + ["冲抵", "合计"]
 
     last_col_guess = 5 + len(headers) * 2 + 2 + len(ded_blocks) * 2
-
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col_guess)
     ws.cell(1, 1).value = "司机工资单汇总（按线路 + 重量档位 + 首票/联单）"
     ws.cell(1, 1).font = title_font
@@ -398,19 +412,17 @@ def build_workbook(
     ws.column_dimensions["E"].width = 14
 
     # -------------------------
-    # 7) 写行：itertuples 用 name=None，按列名取值（不踩坑）
+    # 7) 写行：扣款只写第一行；无派费司机 route="" 则送货为0
     # -------------------------
     row_start = 6
     for i, rtuple in enumerate(drivers_rows.itertuples(index=False, name=None), start=1):
-        # drivers_rows columns order:
-        # [快递员ID, 快递员, route, is_first_row]
+        # columns order: [快递员ID, 快递员, route, is_first_row]
         did = str(rtuple[0]).strip()
         dname = str(rtuple[1]).strip()
         route = str(rtuple[2]).strip()
         is_first_row = bool(rtuple[3])
 
         r = row_start + i - 1
-
         ws.cell(r, 1).value = i
         ws.cell(r, 2).value = f"{dname} ({did})"
         ws.cell(r, 5).value = route
@@ -440,18 +452,22 @@ def build_workbook(
         ws.cell(r, delivery_total_cnt_col).value = f"=SUM({','.join(delivery_cnt_cells)})"
         ws.cell(r, delivery_total_amt_col).value = f"=SUM({','.join(delivery_amt_cells)})"
 
-        # 扣款只在第一行写
+        # 扣款块
         if is_first_row:
             colp = ded_start_col
+
+            # 理赔类型动态列
             for t in claim_types:
                 ws.cell(r, colp).value = claim_cnt.get((did, t), 0)
                 ws.cell(r, colp + 1).value = float(claim_amt.get((did, t), 0.0))
                 colp += 2
 
+            # 冲抵
             ws.cell(r, colp).value = int(offset_cnt.get(did, 0))
             ws.cell(r, colp + 1).value = float(offset_amt.get(did, 0.0))
             colp += 2
 
+            # 合计（除最后“合计”块本身外）
             cnt_terms, amt_terms = [], []
             for j in range(ded_start_col, ded_start_col + (len(ded_blocks) - 1) * 2, 2):
                 cnt_terms.append(f"{get_column_letter(j)}{r}")
@@ -462,9 +478,11 @@ def build_workbook(
             for k in range(ded_start_col, ded_total_amt_col + 1):
                 ws.cell(r, k).value = 0
 
+        # 应付工资：符号完全跟随源表，保持 “送货 - 扣款合计”
         ws.cell(r, 4).value = f"={get_column_letter(delivery_total_cnt_col)}{r}"
         ws.cell(r, 3).value = f"={get_column_letter(delivery_total_amt_col)}{r}-{get_column_letter(ded_total_amt_col)}{r}"
 
+        # 行样式
         for cc in range(1, ded_total_amt_col + 1):
             cell = ws.cell(r, cc)
             cell.alignment = center
@@ -474,7 +492,6 @@ def build_workbook(
 
     ws.freeze_panes = "A6"
     return wb
-
 # =========================
 # Session state
 # =========================
