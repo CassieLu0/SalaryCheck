@@ -105,12 +105,12 @@ def build_workbook(
     max_claim_types: int = 20,
 ):
     """
-    ✅ 改成：司机只有一行（跨线路合并）
+    ✅ 司机只出一行（跨线路合并）
     - 线路列：展示该司机本期跑过的所有线路（逗号拼接）
     - 件数：跨线路相加
     - 金额：按“各线路单价”分别计算后再汇总（Python 计算写死数值，不再用 Excel INDEX 公式）
     - 调整（理赔/冲抵）：按司机汇总写一次
-    - 工资：应付 = 送货合计金额 + 调整合计金额（符号跟随源表）
+    - 工资：应付 = 送货合计金额 + 调整合计金额（符号跟随源表，数字是什么就怎么算）
     - 未匹配理赔：以 UNMATCHED::<name> 作为占位 did 也进入司机汇总
     """
 
@@ -134,12 +134,12 @@ def build_workbook(
     if pr[["首票单价", "联单单价"]].isna().any().any():
         raise ValueError("单价表存在空值/非数字，无法生成。")
 
-    price_map = {}
-    for row in pr.itertuples(index=False):
-        route = str(getattr(row, "线路")).strip()
-        bucket = str(getattr(row, "档位")).strip()
-        p_first = float(getattr(row, "首票单价"))
-        p_link = float(getattr(row, "联单单价"))
+    price_map: dict[tuple[str, str, str], float] = {}
+    for _, rr in pr.iterrows():
+        route = str(rr["线路"]).strip()
+        bucket = str(rr["档位"]).strip()
+        p_first = float(rr["首票单价"])
+        p_link = float(rr["联单单价"])
         price_map[(route, bucket, "首票")] = p_first
         price_map[(route, bucket, "联单")] = p_link
 
@@ -161,21 +161,24 @@ def build_workbook(
     # 先按【司机×线路×bucket×ticket】统计件数
     cnt_route = (
         df.groupby([COL_DRIVER_ID, COL_DRIVER, "route", "_bucket", "_ticket"], dropna=False)
-          .size().reset_index(name="件数")
+          .size()
+          .reset_index(name="件数")
     )
 
     # 计算每个组合的金额（按该线路单价）
-    def calc_amt(row):
+    def calc_amt(row: pd.Series) -> float:
         r = str(row["route"]).strip()
         b = str(row["_bucket"]).strip()
         t = str(row["_ticket"]).strip()  # "首票"/"联单"
         n = int(row["件数"])
         p = price_map.get((r, b, t), None)
         if p is None:
-            # 没找到价：直接报错更安全（防止漏算）
             raise ValueError(f"单价表缺少：线路={r} 档位={b} 票型={t}")
         return n * float(p)
 
+    cnt_route["_ticket"] = cnt_route["_ticket"].astype(str)
+    # 统一：确保 ticket 就是 “首票/联单”
+    cnt_route["_ticket"] = cnt_route["_ticket"].replace({"True": "首票", "False": "联单"})
     cnt_route["金额"] = cnt_route.apply(calc_amt, axis=1)
 
     # 再按【司机×bucket×ticket】跨线路汇总件数与金额
@@ -185,10 +188,16 @@ def build_workbook(
                  .reset_index()
     )
 
+    # 断言列存在（防止后面再踩坑）
+    need_cols = [COL_DRIVER_ID, COL_DRIVER, "_bucket", "_ticket", "件数", "金额"]
+    miss_cols = [c for c in need_cols if c not in cnt_driver.columns]
+    if miss_cols:
+        raise ValueError(f"cnt_driver 缺少列: {miss_cols}，当前列: {cnt_driver.columns.tolist()}")
+
     # driver -> routes list（用于展示）
     driver_routes = (
-        df.groupby([COL_DRIVER_ID])[ "route" ]
-          .apply(lambda s: sorted({x.strip() for x in s.astype(str).tolist() if x and str(x).strip()}))
+        df.groupby([COL_DRIVER_ID])["route"]
+          .apply(lambda s: sorted({str(x).strip() for x in s.tolist() if str(x).strip()}))
           .to_dict()
     )
 
@@ -288,6 +297,7 @@ def build_workbook(
         if not unmatched_claim.empty:
             um = unmatched_claim.copy()
             um["_pseudo_did"] = "UNMATCHED::" + um["_name"].astype(str).str.strip()
+
             g_um = um.groupby(["_pseudo_did", "_dtype"], dropna=False).agg(
                 cnt=("费用合计_未税", "size"),
                 amt=("费用合计_未税", "sum"),
@@ -327,7 +337,6 @@ def build_workbook(
 
     # -------------------------
     # 5) 司机集合：派费司机 ∪ 冲抵司机 ∪ 理赔司机（含UNMATCHED）
-    #     且司机只一行
     # -------------------------
     delivery_dids = set(df[COL_DRIVER_ID].unique().tolist())
     all_dids = sorted(set(delivery_dids) | offset_dids | claim_dids)
@@ -344,8 +353,8 @@ def build_workbook(
     for cell in ws_route[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    for _, row in pr.iterrows():
-        ws_route.append([row["线路"], row["档位"], float(row["首票单价"]), float(row["联单单价"])])
+    for _, rr in pr.iterrows():
+        ws_route.append([rr["线路"], rr["档位"], float(rr["首票单价"]), float(rr["联单单价"])])
 
     def write_df_to_sheet(book: Workbook, name: str, dfx: pd.DataFrame):
         wsx = book.create_sheet(name)
@@ -449,14 +458,13 @@ def build_workbook(
     # -------------------------
     # 8) 写数据行（司机一行）
     # -------------------------
-    # 方便查询：driver,bucket,ticket -> (cnt,amt)
-    lookup = {}
-        for _, rr in cnt_driver.iterrows():
-    did = str(rr[COL_DRIVER_ID]).strip()
-    bucket = str(rr["_bucket"]).strip()
-    ticket = str(rr["_ticket"]).strip()
-    lookup[(did, bucket, ticket)] = (int(rr["件数"]), float(rr["金额"]))
-
+    # driver,bucket,ticket -> (cnt,amt)
+    lookup: dict[tuple[str, str, str], tuple[int, float]] = {}
+    for _, rr in cnt_driver.iterrows():
+        did = str(rr[COL_DRIVER_ID]).strip()
+        bucket = str(rr["_bucket"]).strip()
+        ticket = str(rr["_ticket"]).strip()
+        lookup[(did, bucket, ticket)] = (int(rr["件数"]), float(rr["金额"]))
 
     row_start = 6
     for idx, did in enumerate(all_dids, start=1):
@@ -476,8 +484,9 @@ def build_workbook(
 
         for bucket, ticket in headers:
             n, a = lookup.get((did, bucket, ticket), (0, 0.0))
-            ws.cell(r, c).value = n
+            ws.cell(r, c).value = int(n)
             ws.cell(r, c + 1).value = float(a)
+
             delivery_cnt_cells.append(f"{get_column_letter(c)}{r}")
             delivery_amt_cells.append(f"{get_column_letter(c+1)}{r}")
             c += 2
@@ -489,7 +498,7 @@ def build_workbook(
         colp = ded_start_col
 
         for t in claim_types:
-            ws.cell(r, colp).value = claim_cnt.get((did, t), 0)
+            ws.cell(r, colp).value = int(claim_cnt.get((did, t), 0))
             ws.cell(r, colp + 1).value = float(claim_amt.get((did, t), 0.0))
             colp += 2
 
