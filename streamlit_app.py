@@ -480,8 +480,7 @@ def build_workbook(
 
         # 应付工资：符号完全跟随源表，保持 “送货 - 扣款合计”
         ws.cell(r, 4).value = f"={get_column_letter(delivery_total_cnt_col)}{r}"
-        ws.cell(r, 3).value = f"={get_column_letter(delivery_total_amt_col)}{r}-{get_column_letter(ded_total_amt_col)}{r}"
-
+        ws.cell(r, 3).value = f"={get_column_letter(delivery_total_amt_col)}{r}+{get_column_letter(ded_total_amt_col)}{r}"
         # 行样式
         for cc in range(1, ded_total_amt_col + 1):
             cell = ws.cell(r, cc)
