@@ -105,11 +105,12 @@ def build_workbook(
     max_claim_types: int = 20,
 ):
     """
-    ✅ 修复点：
-    1) drivers = 派费司机 ∪ 冲抵司机 ∪ 理赔司机（支持“只有扣款没有派费”的司机也出现在汇总里）
+    ✅ 修复点（按你最终口径）：
+    1) drivers = 派费司机 ∪ 冲抵司机 ∪ 理赔司机 ∪ 未匹配理赔(占位did)
     2) 同司机多线路：扣款/理赔只写在该司机第一行，避免重复
     3) 理赔类型不丢：除“轨迹断更/虚假签收”外，其他类型保留原字样并动态出列
     4) 金额符号完全跟随源表：数字是什么就怎么算（不abs、不强制取负）
+    5) 工资公式：应付工资 = 送货合计金额 + 扣款合计金额（扣款合计是“调整金额”，可正可负）
     """
     # -------------------------
     # 0) 基础校验
@@ -174,6 +175,7 @@ def build_workbook(
 
     # -------------------------
     # 3) 理赔汇总（按司机ID；符号跟随源表；类型动态列）
+    #     + 未匹配理赔：使用占位 did = UNMATCHED::<name>
     # -------------------------
     claim_cnt, claim_amt = {}, {}
     claim_dids = set()
@@ -214,6 +216,7 @@ def build_workbook(
 
         unmatched_claim = dfc[dfc["_did"].isna()].copy()
 
+        # ---- 已匹配到真实 did 的理赔汇总 ----
         dfc_ok = dfc[dfc["_did"].notna()].copy()
         dfc_ok["_did"] = dfc_ok["_did"].astype(str).str.strip()
 
@@ -229,12 +232,30 @@ def build_workbook(
 
         claim_dids = set(dfc_ok["_did"].unique().tolist())
 
+        # ---- 未匹配理赔也汇总进司机汇总：占位 did = UNMATCHED::<name> ----
+        if unmatched_claim is not None and not unmatched_claim.empty:
+            um = unmatched_claim.copy()
+            um["_name"] = um["_name"].astype(str).str.strip()
+            um["_dtype"] = um["_dtype"].astype(str).str.strip()
+            um["_pseudo_did"] = "UNMATCHED::" + um["_name"]
+
+            g_um = um.groupby(["_pseudo_did", "_dtype"], dropna=False).agg(
+                cnt=("费用合计_未税", "size"),
+                amt=("费用合计_未税", "sum"),
+            )
+            for (pseudo_did, dtype), row in g_um.iterrows():
+                did_s = str(pseudo_did).strip()
+                dtype_s = str(dtype).strip()
+                claim_cnt[(did_s, dtype_s)] = claim_cnt.get((did_s, dtype_s), 0) + int(row["cnt"])
+                claim_amt[(did_s, dtype_s)] = claim_amt.get((did_s, dtype_s), 0.0) + float(row["amt"])
+
+            claim_dids |= set(g_um.index.get_level_values(0).astype(str).tolist())
+
     # 动态理赔类型（可限制数量，防止爆表）
     claim_types = sorted({dtype for (_, dtype) in claim_cnt.keys()})
     if len(claim_types) > max_claim_types:
-        # 按类型总金额绝对值排序，取前N，其余并到“其他”
         type_sum_abs = {}
-        for (did, dtype), amt in claim_amt.items():
+        for (_did, dtype), amt in claim_amt.items():
             type_sum_abs[dtype] = type_sum_abs.get(dtype, 0.0) + abs(float(amt))
         top_types = [t for t, _ in sorted(type_sum_abs.items(), key=lambda x: x[1], reverse=True)[:max_claim_types]]
 
@@ -250,7 +271,7 @@ def build_workbook(
             claim_types.append("其他")
 
     # -------------------------
-    # 4) drivers_rows：派费司机(司机×线路) ∪ 冲抵司机 ∪ 理赔司机
+    # 4) drivers_rows：派费司机(司机×线路) ∪ 冲抵司机 ∪ 理赔司机（含UNMATCHED）
     #    且：扣款只写第一行
     # -------------------------
     delivery_drivers = (
@@ -275,7 +296,14 @@ def build_workbook(
         .to_dict()
     )
 
-    # 补充：仅扣款无派费
+    # 让占位 did 在汇总里显示成对应名字
+    for did in list(claim_dids):
+        did_s = str(did)
+        if did_s.startswith("UNMATCHED::"):
+            nm = did_s.split("UNMATCHED::", 1)[1].strip() or "UNKNOWN"
+            did_to_name[did_s] = f"{nm} (UNMATCHED)"
+
+    # 补充：仅扣款无派费（含UNMATCHED）
     extra_dids = [d for d in all_dids if d not in delivery_dids]
     extra = pd.DataFrame({
         COL_DRIVER_ID: extra_dids,
@@ -384,7 +412,7 @@ def build_workbook(
     col += 2
 
     ws.merge_cells(start_row=3, start_column=col, end_row=3, end_column=col + len(ded_blocks) * 2 - 1)
-    ws.cell(3, col).value = "工资扣款"
+    ws.cell(3, col).value = "工资调整（符号跟随源表）"
 
     for i, name in enumerate(ded_blocks):
         ws.merge_cells(start_row=4, start_column=col + i * 2, end_row=4, end_column=col + i * 2 + 1)
@@ -416,7 +444,6 @@ def build_workbook(
     # -------------------------
     row_start = 6
     for i, rtuple in enumerate(drivers_rows.itertuples(index=False, name=None), start=1):
-        # columns order: [快递员ID, 快递员, route, is_first_row]
         did = str(rtuple[0]).strip()
         dname = str(rtuple[1]).strip()
         route = str(rtuple[2]).strip()
@@ -452,11 +479,10 @@ def build_workbook(
         ws.cell(r, delivery_total_cnt_col).value = f"=SUM({','.join(delivery_cnt_cells)})"
         ws.cell(r, delivery_total_amt_col).value = f"=SUM({','.join(delivery_amt_cells)})"
 
-        # 扣款块
+        # 调整块
         if is_first_row:
             colp = ded_start_col
 
-            # 理赔类型动态列
             for t in claim_types:
                 ws.cell(r, colp).value = claim_cnt.get((did, t), 0)
                 ws.cell(r, colp + 1).value = float(claim_amt.get((did, t), 0.0))
@@ -478,9 +504,11 @@ def build_workbook(
             for k in range(ded_start_col, ded_total_amt_col + 1):
                 ws.cell(r, k).value = 0
 
-        # 应付工资：符号完全跟随源表，保持 “送货 - 扣款合计”
+        # ✅ 工资公式（按你口径：数字是什么就怎么算）
+        # 应付工资 = 送货合计金额 + 调整合计金额
         ws.cell(r, 4).value = f"={get_column_letter(delivery_total_cnt_col)}{r}"
         ws.cell(r, 3).value = f"={get_column_letter(delivery_total_amt_col)}{r}+{get_column_letter(ded_total_amt_col)}{r}"
+
         # 行样式
         for cc in range(1, ded_total_amt_col + 1):
             cell = ws.cell(r, cc)
